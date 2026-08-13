@@ -34,9 +34,19 @@ const MAX_CARDS_PER_NOTE = 60;   // 提交给子会话的卡片上限（控制 p
 
 // 漏斗阈值（explore 验证口径，见 runs/explore_1）
 const CTR_OK_MIN = 0.10, CTR_OK_MAX = 0.20;
-const RETENTION_BREAK_S = 10;    // 人均观看 <10s 记留存断档
 const INTERACT_HOT = 0.05, INTERACT_OK = 0.03; // 互动率 5%-10% 爆款线，>=3% 合格
 const FAN_BREAK = 0.01;          // 涨粉率 <1% 记断档
+
+// 留存断档阈值按笔记类型分设（v1.1.0 修正）：图文以「读完」为主，停留天然短于视频，
+// 用同一把 10s 尺子会把正常图文误判成断档。
+const RETENTION_BREAK_S_VIDEO = 10;  // 视频人均观看 <10s 记断档
+const RETENTION_BREAK_S_IMAGE = 5;   // 图文人均观看 <5s 记断档
+const RETENTION_BREAK_S = RETENTION_BREAK_S_VIDEO; // 体裁未识别时的兜底口径
+
+// 对标爆款门槛（v1.1.0 新增）：低赞笔记不配进对标表，宁缺毋滥。
+const BENCH_MIN_LIKES = 1000;    // 绝对门槛：低于 1000 赞一律不算爆款
+const BENCH_MEDIAN_MULT = 3;     // 相对门槛：需达到该关键词结果集点赞中位数的 3 倍
+const BENCH_MAX_LIKES_FLOOR = 3000; // 相对门槛上限：中位数极高时不至于把门槛推到无解
 
 // ============ 基础工具 ============
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -228,16 +238,28 @@ function normalizeKeywords(res) {
   }
   return out;
 }
-function normalizeBenchmarks(res) {
-  const list = getArray(res, 'benchmarks')
+function normalizeBenchmarks(res, likesFloor = BENCH_MIN_LIKES) {
+  const raw = getArray(res, 'benchmarks')
     .filter(b => b && typeof b === 'object' && b.title)
-    .map(b => ({ title: String(b.title).trim(), author: String(b.author || '').trim(), likes: String(b.likes || '').trim() }));
-  const benchmarks = list.slice(0, 3);
-  // enough 判定以实际可展示的对标行数 + 子会话自评条数双重为准：Accept 底线是「对标爆款表 ≥3 条」，
-  // 行数不足 3 或子会话判定相关条数不足 3 都记 partial（避免子会话自评与行数矛盾时误判）
-  const actual = Math.max(getNum(res, 'actual_count', benchmarks.length), benchmarks.length);
-  const enough = benchmarks.length >= 3 && actual >= 3 && getBool(res, 'enough', true);
-  return { benchmarks, enough, actual_count: actual, reason: getStr(res, 'reason') };
+    .map(b => ({
+      title: String(b.title).trim(),
+      author: String(b.author || '').trim(),
+      likes: String(b.likes || '').trim(),
+      likes_num: parseLikes(b.likes),
+    }));
+  // 质量门槛（v1.1.0）：子会话为了凑满 3 条会把低赞笔记也塞进来（实测出现过 63 赞与 4494 赞同表），
+  // 在代码侧硬过滤，宁缺毋滥——达不到门槛就记 partial，不许凑数。
+  const kept = raw.filter(b => b.likes_num >= likesFloor);
+  const benchmarks = kept.slice(0, 3).map(b => ({ title: b.title, author: b.author, likes: b.likes }));
+  const dropped = raw.length - kept.length;
+  // enough 判定以「过滤后可展示的对标行数」为准：不足 3 条记 partial
+  const actual = benchmarks.length;
+  const enough = benchmarks.length >= 3 && getBool(res, 'enough', true);
+  let reason = getStr(res, 'reason');
+  if (dropped > 0) {
+    reason = `已按爆款门槛（≥${likesFloor} 赞）剔除 ${dropped} 条低赞笔记` + (reason ? `；子会话说明：${reason}` : '');
+  }
+  return { benchmarks, enough, actual_count: actual, reason, likes_floor: likesFloor, dropped };
 }
 function normalizeActions(res) {
   return getArray(res, 'actions').map(a => String(a).trim()).filter(Boolean).slice(0, 3);
@@ -257,7 +279,17 @@ ${JSON.stringify(batch.map((n, i) => ({ index: i, title: n.title })))}
 {"keywords":[{"index":<对应输入 index>,"title":"<该笔记原标题，与输入完全一致>","keywords":["关键词1",...]}]}`;
 }
 
-function buildBenchmarkPrompt(note, keywords, cards, ownNickname) {
+// 爆款门槛按该关键词结果集的点赞中位数动态定档：不同赛道的"爆款"绝对值差异极大
+//（美妆万赞起步、垂类工具千赞已是头部），只用固定值会一刀切。
+function computeLikesFloor(cards) {
+  const nums = cards.map(c => parseLikes(c.likes)).filter(n => n > 0).sort((a, b) => a - b);
+  if (!nums.length) return BENCH_MIN_LIKES;
+  const mid = nums.length % 2 ? nums[(nums.length - 1) / 2] : Math.round((nums[nums.length / 2 - 1] + nums[nums.length / 2]) / 2);
+  const dynamic = mid * BENCH_MEDIAN_MULT;
+  return Math.max(BENCH_MIN_LIKES, Math.min(BENCH_MAX_LIKES_FLOOR, dynamic));
+}
+
+function buildBenchmarkPrompt(note, keywords, cards, ownNickname, likesFloor) {
   const cardList = cards.slice(0, MAX_CARDS_PER_NOTE).map((c, i) => ({
     i, title: c.title, author: c.author, likes: c.likes, likes_num: parseLikes(c.likes),
   }));
@@ -268,28 +300,36 @@ function buildBenchmarkPrompt(note, keywords, cards, ownNickname) {
 请筛选出与该笔记【题材+视角】最相似的爆款笔记作为对标。
 视角类型例如：实测/使用体验、清单/合集、横评/对比、教程/攻略、血泪教训/避坑、测评、案例分享等。
 筛选规则：
+- 【硬门槛】只有 likes_num >= ${likesFloor} 的卡片才算"爆款"，低于此值的一律不得入选（本关键词结果集点赞中位数换算而来）。
 - 按「题材/视角相似度」优先，点赞数作佐证（相似度相同时点赞高者优先）。
 - 剔除与本笔记题材无关的混入内容（关键词过宽常混入榜单、新闻、其他领域内容）。${nicknameRule}
-- 最多返回 3 条；若相关爆款不足 3 条，如实返回实际条数并说明原因（如关键词过宽混入无关内容）。
+- 【宁缺毋滥】最多返回 3 条；同时满足门槛与相似度的不足 3 条时，如实只返回合格的条目并说明原因（如关键词过宽混入无关内容、该词下无高赞同题材笔记），**严禁用低赞或不相关笔记凑满 3 条**。
 搜索结果卡片（JSON）：
 ${JSON.stringify(cardList)}
 输出 ONLY JSON（无其他文字，无 markdown 代码围栏），格式：
-{"benchmarks":[{"title":"爆款标题","author":"作者","likes":"点赞数原文"}],"enough":true或false,"actual_count":<实际相关条数>,"reason":"不足 3 条时的原因说明；充足时给一句话总结"}`;
+{"benchmarks":[{"title":"爆款标题","author":"作者","likes":"点赞数原文"}],"enough":true或false,"actual_count":<实际合格条数>,"reason":"不足 3 条时的原因说明；充足时给一句话总结"}`;
 }
 
 function buildActionPrompt(note, benchmarks) {
-  return `你是小红书运营分析师。请基于一条笔记的官方数据与 3 条对标爆款，为该笔记生成 3 条【具体可执行】的改进动作。
+  const type = noteType(note);
+  const floor = retentionFloor(note);
+  return `你是小红书运营分析师。请基于一条笔记的官方数据与对标爆款，为该笔记生成 3 条【具体可执行】的改进动作。
 本笔记官方数据（创作者后台导出）：
 ${JSON.stringify({
-    title: note.title, publish_time: note.publish_time, exposure: note.exposure, views: note.views,
-    ctr_pct: (note.ctr * 100).toFixed(1) + '%', likes: note.likes, comments: note.comments,
+    title: note.title, note_type: type, publish_time: note.publish_time,
+    days_since_publish: daysSince(note.publish_time),
+    exposure: note.exposure, exposure_per_day: perDay(note.exposure, note.publish_time),
+    views: note.views, ctr_pct: (note.ctr * 100).toFixed(1) + '%', likes: note.likes, comments: note.comments,
     collects: note.collects, fans: note.fans, shares: note.shares, avg_watch_sec: note.avg_watch_sec,
+    retention_break_sec: floor,
   })}
-对标爆款（3 条相似爆款）：
+对标爆款（同题材高赞笔记，可能少于 3 条）：
 ${JSON.stringify(benchmarks)}
 要求：
 - 3 条动作必须具体可执行：给出标题改写示例句、封面/首段钩子写法、正文结构调整、收藏/评论引导话术等，禁止概念性泛泛建议。
-- 针对本笔记数据弱点对症下药：点击率低→封面与标题；人均观看短（<10s）→首段 3 秒钩子；无收藏→收藏引导；无评论→评论钩子等。
+- 针对本笔记数据弱点对症下药：点击率低→封面与标题；人均观看低于本体裁断档线（${type} 为 ${floor}s）→首段 3 秒钩子；无收藏→收藏引导；无评论→评论钩子等。
+- 注意体裁差异：图文的"留存"是读完率，靠首图信息量与分段排版；视频靠前 3 秒画面与口播节奏。建议须与 ${type} 这一体裁匹配。
+- 曝光要看 exposure_per_day（日均曝光）而不是曝光总量，老笔记曝光总量天然更高。
 - 每条 60-150 字，中文。
 输出 ONLY JSON（无其他文字，无 markdown 代码围栏），格式：
 {"actions":["动作1","动作2","动作3"]}`;
@@ -569,6 +609,34 @@ async function searchKeywordWithRetry(keyword) {
   }
 }
 
+// ============ 笔记类型与时间归一化（v1.1.0） ============
+// 体裁来自创作者后台导出 Excel 的「体裁」列（常见值：图文 / 视频）。
+function noteType(n) {
+  const g = String((n && n.genre) || '').trim();
+  if (/视频|video/i.test(g)) return '视频';
+  if (/图文|图片|image/i.test(g)) return '图文';
+  // 兜底：图文笔记后台不给「人均观看时长」以外的视频指标，弹幕>0 基本可判定为视频
+  if (Number(n && n.danmaku) > 0) return '视频';
+  return '未知';
+}
+function retentionFloor(n) {
+  const t = noteType(n);
+  if (t === '视频') return RETENTION_BREAK_S_VIDEO;
+  if (t === '图文') return RETENTION_BREAK_S_IMAGE;
+  return RETENTION_BREAK_S;
+}
+// 已发布天数：曝光是随时间累积的存量，7 天的笔记和 46 天的笔记直接比曝光没有意义。
+function daysSince(publishTime) {
+  const t = Date.parse(String(publishTime || '').replace(/-/g, '/'));
+  if (!Number.isFinite(t)) return 1;
+  const d = Math.floor((Date.now() - t) / 86400000);
+  return Math.max(1, d);
+}
+function perDay(value, publishTime) {
+  const d = daysSince(publishTime);
+  return Math.round((Number(value) || 0) / d);
+}
+
 // ============ 步骤 11：漏斗计算（阈值固定） ============
 function computeFunnel(notes) {
   const sum = f => notes.reduce((a, n) => a + (Number(n[f]) || 0), 0);
@@ -577,7 +645,9 @@ function computeFunnel(notes) {
   const totalFans = sum('fans'), totalShares = sum('shares');
   const avgCtr = totalExp ? totalViews / totalExp : 0;
   const ctrVerdict = avgCtr > CTR_OK_MAX ? '优秀' : (avgCtr >= CTR_OK_MIN ? '合格' : '偏弱');
-  const retentionBad = notes.filter(n => (Number(n.avg_watch_sec) || 0) < RETENTION_BREAK_S).length;
+  // 留存按各自体裁的阈值判定（图文 5s / 视频 10s），不再一刀切 10s
+  const retentionBadNotes = notes.filter(n => (Number(n.avg_watch_sec) || 0) < retentionFloor(n));
+  const retentionBad = retentionBadNotes.length;
   const retentionVerdict = retentionBad === 0 ? '合格' : (retentionBad >= 2 ? '断档' : '偏弱');
   const interactRate = totalViews ? (totalLikes + totalComments + totalCollects) / totalViews : 0;
   const interactVerdict = interactRate >= INTERACT_HOT ? '爆款线以上' : (interactRate >= INTERACT_OK ? '合格' : (interactRate > 0 ? '偏弱' : '断档'));
@@ -585,12 +655,18 @@ function computeFunnel(notes) {
   const fanVerdict = fanRate < FAN_BREAK ? '断档' : '合格';
   const pct = (v, d = 1) => (v * 100).toFixed(d) + '%';
   const watchTimes = notes.map(n => Number(n.avg_watch_sec) || 0);
+  // 日均曝光：按各自已发布天数归一化后再比较，避免"老笔记曝光高"被误读成内容更好
+  const expPerDay = notes.map(n => perDay(n.exposure, n.publish_time));
+  const typeCount = notes.reduce((a, n) => { const t = noteType(n); a[t] = (a[t] || 0) + 1; return a; }, {});
+  const typeSummary = Object.entries(typeCount).map(([k, v]) => `${k} ${v} 条`).join(' / ');
   return {
     totalExp, totalViews, totalLikes, totalComments, totalCollects, totalFans, totalShares,
-    avgCtr, ctrVerdict, retentionBad, retentionVerdict, interactRate, interactVerdict,
-    fanRate, fanVerdict, pct,
+    avgCtr, ctrVerdict, retentionBad, retentionBadNotes, retentionVerdict, interactRate, interactVerdict,
+    fanRate, fanVerdict, pct, typeCount, typeSummary,
     maxWatch: watchTimes.length ? Math.max(...watchTimes) : 0,
     minWatch: watchTimes.length ? Math.min(...watchTimes) : 0,
+    maxExpPerDay: expPerDay.length ? Math.max(...expPerDay) : 0,
+    minExpPerDay: expPerDay.length ? Math.min(...expPerDay) : 0,
   };
 }
 
@@ -614,12 +690,13 @@ function todayStr() {
 function buildConclusion(f, notes) {
   const n = notes.length;
   const parts = [`封面点击率整体为 ${f.pct(f.avgCtr)}（${f.ctrVerdict}）`];
-  if (f.retentionBad > 0) parts.push(`${f.retentionBad}/${n} 条人均观看不足 10s（${f.retentionVerdict}）`);
+  if (f.retentionBad > 0) parts.push(`${f.retentionBad}/${n} 条人均观看低于同体裁断档线（图文 ${RETENTION_BREAK_S_IMAGE}s / 视频 ${RETENTION_BREAK_S_VIDEO}s，${f.retentionVerdict}）`);
+  else parts.push(`人均观看均达同体裁断档线以上（${f.retentionVerdict}）`);
   parts.push(`互动率 ${f.pct(f.interactRate)}（${f.interactVerdict}）`);
   if (f.totalFans === 0) parts.push('涨粉为零（断档）');
   else parts.push(`涨粉率 ${f.pct(f.fanRate, 2)}（${f.fanVerdict}）`);
   const decay = f.retentionVerdict !== '合格' || f.interactVerdict === '偏弱' || f.interactVerdict === '断档' || f.fanVerdict !== '合格';
-  return '诊断结论：' + parts.join('；') + '。' +
+  return `诊断结论（本批 ${f.typeSummary || '体裁未识别'}）：` + parts.join('；') + '。' +
     (decay ? '「点击 → 留存 → 互动 → 涨粉」存在逐层衰减，优先修复「正文前 3 秒钩子」与「收藏/评论引导」。' : '「点击 → 留存 → 互动 → 涨粉」整体健康。');
 }
 
@@ -630,8 +707,11 @@ function buildReportHtml(ctx, f, reportFull) {
   const rows = ctx.notes.map((n) => `
     <tr>
       <td class="t">${esc(n.title)}</td>
+      <td>${esc(noteType(n))}</td>
       <td>${esc(n.publish_time)}</td>
+      <td>${daysSince(n.publish_time)}天</td>
       <td>${n.exposure}</td>
+      <td>${perDay(n.exposure, n.publish_time)}</td>
       <td>${n.views}</td>
       <td>${fmtCtr(n.ctr)}</td>
       <td>${n.likes}</td>
@@ -642,20 +722,20 @@ function buildReportHtml(ctx, f, reportFull) {
       <td>${n.avg_watch_sec}s</td>
     </tr>`).join('');
 
-  const retTitles = ctx.notes.filter(n => (Number(n.avg_watch_sec) || 0) < 10).map(n => n.title).join('、');
+  const retTitles = (f.retentionBadNotes || []).map(n => `${n.title}（${noteType(n)} ${n.avg_watch_sec}s）`).join('、');
 
   const stages = `
     <div class="stage">
       <div class="name">① 点击率（曝光→观看）</div>
       <div class="value">${f.pct(f.avgCtr)}</div>
       <div><span class="badge ${verdictClass(f.ctrVerdict)}">${f.ctrVerdict}</span></div>
-      <div class="detail">曝光 ${f.totalExp} → 观看 ${f.totalViews}；<br>合格区间 10%–20%${f.avgCtr > 0.20 ? '，本账号高于优秀线' : ''}。</div>
+      <div class="detail">曝光 ${f.totalExp} → 观看 ${f.totalViews}；<br>合格区间 10%–20%${f.avgCtr > 0.20 ? '，本账号高于优秀线' : ''}。<br>日均曝光 ${f.maxExpPerDay} 最高 / ${f.minExpPerDay} 最低（已按发布天数归一化）。</div>
     </div>
     <div class="stage">
       <div class="name">② 内容留存（人均观看时长）</div>
       <div class="value">${f.maxWatch}s 最优 / ${f.minWatch}s 最差</div>
       <div><span class="badge ${verdictClass(f.retentionVerdict)}">${f.retentionVerdict}</span></div>
-      <div class="detail">${f.retentionBad} 条人均观看 &lt;10s（断档线）：${esc(retTitles || '（无）')}。</div>
+      <div class="detail">断档线按体裁分设：图文 &lt;${RETENTION_BREAK_S_IMAGE}s / 视频 &lt;${RETENTION_BREAK_S_VIDEO}s。<br>本批 ${f.retentionBad} 条低于断档线：${esc(retTitles || '（无）')}。</div>
     </div>
     <div class="stage">
       <div class="name">③ 互动率（赞+评+藏）/观看</div>
@@ -677,15 +757,15 @@ function buildReportHtml(ctx, f, reportFull) {
     const bmRows = b.benchmarks.map((x, j) =>
       `<tr><td>${j + 1}</td><td class="t">${esc(x.title)}</td><td>${esc(x.author)}</td><td>${esc(x.likes)}</td></tr>`).join('');
     const bmNote = !b.enough
-      ? `<p class="warn">⚠ 相关爆款不足 3 条（实际 ${b.actual_count} 条）：${esc(b.reason)}</p>` : '';
+      ? `<p class="warn">⚠ 达到爆款门槛（≥${b.likes_floor || BENCH_MIN_LIKES} 赞）且题材相似的对标不足 3 条（实际 ${b.actual_count} 条）：${esc(b.reason)}。宁缺毋滥，未用低赞笔记凑数。</p>` : '';
     const actItems = acts.length ? acts.map(a => `<li>${esc(a)}</li>`).join('')
       : '<li class="warn">改进动作生成失败（子会话未返回）。</li>';
     const interact = n.likes + n.comments + n.collects;
     return `
     <div class="note-card">
       <h3><span class="idx">${i + 1}</span>${esc(n.title)}</h3>
-      <p class="meta">关键词：<b>${esc(kws || '（无）')}</b> ｜ 曝光 ${n.exposure} ｜ 观看 ${n.views} ｜ 点击率 ${fmtCtr(n.ctr)} ｜ 互动 ${interact} ｜ 涨粉 ${n.fans}</p>
-      <h4>对标爆款表（3 条相似爆款）</h4>
+      <p class="meta">${esc(noteType(n))} ｜ 已发布 ${daysSince(n.publish_time)} 天 ｜ 关键词：<b>${esc(kws || '（无）')}</b> ｜ 曝光 ${n.exposure}（日均 ${perDay(n.exposure, n.publish_time)}） ｜ 观看 ${n.views} ｜ 点击率 ${fmtCtr(n.ctr)} ｜ 互动 ${interact} ｜ 涨粉 ${n.fans}</p>
+      <h4>对标爆款表（点赞门槛 ≥${b.likes_floor || BENCH_MIN_LIKES}）</h4>
       <table><thead><tr><th>#</th><th>标题</th><th>作者</th><th>点赞数</th></tr></thead><tbody>${bmRows}</tbody></table>
       ${bmNote}
       <h4>3 条改进动作</h4>
@@ -694,8 +774,8 @@ function buildReportHtml(ctx, f, reportFull) {
   }).join('');
 
   const footerNote = reportFull
-    ? '本次关键词搜索结果中相关爆款均 ≥3 条，报告完整（full）。'
-    : `本次有 ${ctx.partials.length} 条笔记相关爆款不足 3 条（partial）：${ctx.partials.map(p => `「${p.title}」实际 ${p.count} 条（${p.reason}）`).join('；')}。`;
+    ? '本次每条笔记均找到 ≥3 条达到点赞门槛的同题材对标爆款，报告完整（full）。'
+    : `本次有 ${ctx.partials.length} 条笔记的合格对标不足 3 条（partial，宁缺毋滥不凑数）：${ctx.partials.map(p => `「${p.title}」实际 ${p.count} 条（${p.reason}）`).join('；')}。`;
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -737,8 +817,9 @@ function buildReportHtml(ctx, f, reportFull) {
   <p style="color:#888;font-size:13px;">分析对象：账号「${esc(nickname)}」 ｜ 数据来源：创作者后台官方数据看板（导出 Excel）＋ 小红书公开搜索结果 ｜ 生成时间：${new Date().toLocaleString('zh-CN')}</p>
 
   <h2>① 数据总表（最近 ${ctx.notes.length} 条笔记，按首发时间倒序）</h2>
+  <p style="color:#999;font-size:12px;margin:4px 0 10px;">曝光是随时间累积的存量，新旧笔记不可直接比大小，故额外给出「日均曝光 = 曝光 / 已发布天数」；留存断档线按体裁分设（图文 ${RETENTION_BREAK_S_IMAGE}s / 视频 ${RETENTION_BREAK_S_VIDEO}s）。</p>
   <table>
-    <thead><tr><th>标题</th><th>首发时间</th><th>曝光</th><th>观看量</th><th>封面点击率</th><th>点赞</th><th>评论</th><th>收藏</th><th>涨粉</th><th>分享</th><th>人均观看时长</th></tr></thead>
+    <thead><tr><th>标题</th><th>类型</th><th>首发时间</th><th>已发布</th><th>曝光</th><th>日均曝光</th><th>观看量</th><th>封面点击率</th><th>点赞</th><th>评论</th><th>收藏</th><th>涨粉</th><th>分享</th><th>人均观看时长</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>
 
@@ -762,21 +843,22 @@ function buildMarkdown(ctx, f, reportFull) {
   L.push(`- 分析账号：${ctx.accountNickname || '（未能识别账号昵称）'}`);
   L.push('- 数据来源：创作者后台官方数据看板导出 Excel');
   L.push(`- 分析参数：notes_count=${ctx.notesCount}，keyword_per_note=${ctx.kwPerNote}`);
-  L.push(`- 报告状态：${reportFull ? 'full（相关爆款均 ≥3 条）' : 'partial（存在不足 3 条的关键词）'}`);
+  L.push(`- 报告状态：${reportFull ? 'full（每条笔记均有 ≥3 条达到点赞门槛的同题材对标）' : 'partial（存在合格对标不足 3 条的笔记，宁缺毋滥不凑数）'}`);
   L.push(`- 报告文件：${ctx.reportPath}`);
   L.push('- 竞对数据仅使用搜索结果页公开可见的标题、作者与点赞数', '');
 
   L.push(`## ① 数据总表（最近 ${ctx.notes.length} 条笔记，按首发时间倒序）`, '');
-  L.push('| 标题 | 首发时间 | 曝光 | 观看量 | 封面点击率 | 点赞 | 评论 | 收藏 | 涨粉 | 分享 | 人均观看时长 |');
-  L.push('|---|---|---|---|---|---|---|---|---|---|---|');
+  L.push('> 曝光是随时间累积的存量，新旧笔记不可直接比大小，故额外给出「日均曝光 = 曝光 / 已发布天数」。', '');
+  L.push('| 标题 | 类型 | 首发时间 | 已发布 | 曝光 | 日均曝光 | 观看量 | 封面点击率 | 点赞 | 评论 | 收藏 | 涨粉 | 分享 | 人均观看时长 |');
+  L.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|');
   for (const n of ctx.notes) {
-    L.push(`| ${n.title} | ${n.publish_time} | ${n.exposure} | ${n.views} | ${fmtCtr(n.ctr)} | ${n.likes} | ${n.comments} | ${n.collects} | ${n.fans} | ${n.shares} | ${n.avg_watch_sec}s |`);
+    L.push(`| ${n.title} | ${noteType(n)} | ${n.publish_time} | ${daysSince(n.publish_time)}天 | ${n.exposure} | ${perDay(n.exposure, n.publish_time)} | ${n.views} | ${fmtCtr(n.ctr)} | ${n.likes} | ${n.comments} | ${n.collects} | ${n.fans} | ${n.shares} | ${n.avg_watch_sec}s |`);
   }
   L.push('', '## ② 转化漏斗健康度诊断', '');
   L.push('| 层级 | 指标 | 数值 | 判断 | 说明 |');
   L.push('|---|---|---|---|---|');
-  L.push(`| ① 点击率（曝光→观看） | 观看量/曝光 | ${f.pct(f.avgCtr)}（${f.totalViews}/${f.totalExp}） | ${f.ctrVerdict} | 合格区间 10%-20% |`);
-  L.push(`| ② 内容留存（人均观看时长） | 人均观看时长 | 最优 ${f.maxWatch}s / 最差 ${f.minWatch}s | ${f.retentionVerdict} | ${f.retentionBad} 条人均观看 <10s 断档线 |`);
+  L.push(`| ① 点击率（曝光→观看） | 观看量/曝光 | ${f.pct(f.avgCtr)}（${f.totalViews}/${f.totalExp}） | ${f.ctrVerdict} | 合格区间 10%-20%；日均曝光 ${f.maxExpPerDay} 最高 / ${f.minExpPerDay} 最低 |`);
+  L.push(`| ② 内容留存（人均观看时长） | 人均观看时长 | 最优 ${f.maxWatch}s / 最差 ${f.minWatch}s | ${f.retentionVerdict} | 断档线按体裁分设：图文 <${RETENTION_BREAK_S_IMAGE}s / 视频 <${RETENTION_BREAK_S_VIDEO}s；本批 ${f.retentionBad} 条低于断档线 |`);
   L.push(`| ③ 互动率（(赞+评+藏)/观看） | 互动/观看 | ${f.pct(f.interactRate)}（${f.totalLikes + f.totalComments + f.totalCollects}/${f.totalViews}） | ${f.interactVerdict} | 爆款线 5%-10%；赞 ${f.totalLikes} / 评 ${f.totalComments} / 藏 ${f.totalCollects} |`);
   L.push(`| ④ 涨粉（观看→关注） | 涨粉数 | ${f.totalFans} 粉 / ${ctx.notes.length} 条（${f.pct(f.fanRate, 2)}） | ${f.fanVerdict} | ${f.totalShares} 次分享 |`);
   L.push('', buildConclusion(f, ctx.notes), '');
@@ -784,12 +866,12 @@ function buildMarkdown(ctx, f, reportFull) {
   L.push('## ③ 逐条笔记：对标爆款 + 改进动作', '');
   ctx.notes.forEach((n, i) => {
     const b = ctx.benchmarks[i] || { benchmarks: [], enough: false, actual_count: 0, reason: '' };
-    L.push(`### 笔记 ${i + 1}：${n.title}（关键词：${(ctx.keywords[i] || []).join(' / ') || '无'}）`, '');
-    L.push('对标爆款表：', '');
+    L.push(`### 笔记 ${i + 1}：${n.title}（${noteType(n)}，已发布 ${daysSince(n.publish_time)} 天，关键词：${(ctx.keywords[i] || []).join(' / ') || '无'}）`, '');
+    L.push(`对标爆款表（点赞门槛 ≥${b.likes_floor || BENCH_MIN_LIKES}）：`, '');
     L.push('| # | 标题 | 作者 | 点赞数 |');
     L.push('|---|---|---|---|');
     b.benchmarks.forEach((x, j) => L.push(`| ${j + 1} | ${x.title} | ${x.author} | ${x.likes} |`));
-    if (!b.enough) L.push('', `> ⚠ 相关爆款不足 3 条（实际 ${b.actual_count} 条）：${b.reason}`);
+    if (!b.enough) L.push('', `> ⚠ 达到爆款门槛且题材相似的对标不足 3 条（实际 ${b.actual_count} 条）：${b.reason}。宁缺毋滥，未用低赞笔记凑数。`);
     L.push('', '3 条改进动作：', '');
     const acts = ctx.actions[i] || [];
     acts.forEach((a, j) => L.push(`${j + 1}. ${a}`));
@@ -905,7 +987,7 @@ async function main() {
     for (let i = 0; i < ctx.notes.length; i++) {
       const b = ctx.benchmarks[i];
       if (!b.enough) {
-        let reason = b.reason || '相关爆款不足 3 条';
+        let reason = b.reason || '达到点赞门槛的同题材对标不足 3 条';
         if (!(ctx.keywords[i] || []).length) reason = '关键词提炼失败，未执行搜索';
         else if (!(ctx.cardsByNote[i] || []).length) reason = '搜索未获取到结果卡片';
         ctx.partials.push({ title: ctx.notes[i].title, count: b.actual_count, reason });
@@ -956,11 +1038,11 @@ async function main() {
     summary = '未获取到任何笔记数据（Excel 为空或解析失败）';
   } else if (ctx.partials.length === 0) {
     status = 'success';
-    summary = `已分析最近 ${ctx.notes.length} 条笔记并生成报告：${reportPath}。关键词 ${ctx.totalKeywords} 个，对标爆款均 ≥3 条（full）。`;
+    summary = `已分析最近 ${ctx.notes.length} 条笔记并生成报告：${reportPath}。关键词 ${ctx.totalKeywords} 个，每条笔记均找到 ≥3 条达到点赞门槛的同题材对标爆款（full）。`;
   } else {
     const parts = ctx.partials.map(p => `「${p.title}」实际 ${p.count} 条（${p.reason}）`);
     status = 'partial';
-    summary = `已生成报告（partial）：${ctx.partials.length}/${ctx.notes.length} 条笔记对标爆款不足 3 条——${parts.join('；')}。报告：${reportPath}`;
+    summary = `已生成报告（partial）：${ctx.partials.length}/${ctx.notes.length} 条笔记的合格对标不足 3 条（宁缺毋滥，未用低赞笔记凑数）——${parts.join('；')}。报告：${reportPath}`;
   }
 
   const result = {
@@ -987,9 +1069,10 @@ async function main() {
 
 // ============ 子会话封装（供主流程调用的带兜底实现） ============
 async function pickBenchmarks(noteIdx, note, keywords, cards, ownNickname) {
+  const likesFloor = computeLikesFloor(cards);
   try {
-    const out = await runSubsession(buildBenchmarkPrompt(note, keywords, cards, ownNickname), BENCH_SCHEMA, 'bench');
-    return normalizeBenchmarks(out);
+    const out = await runSubsession(buildBenchmarkPrompt(note, keywords, cards, ownNickname, likesFloor), BENCH_SCHEMA, 'bench');
+    return normalizeBenchmarks(out, likesFloor);
   } catch (e) {
     console.error(`[bench] 对标筛选失败（note ${noteIdx}）:`, e.message);
     return { benchmarks: [], enough: false, actual_count: 0, reason: '对标筛选子会话失败' };
