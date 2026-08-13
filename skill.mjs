@@ -63,12 +63,38 @@ async function relayCall(op, params = {}, timeout = 30000) {
   return data.result;
 }
 
+// 本 skill 的浏览器运行时由 webclaw3 提供，是硬依赖。运行时失败必须自带修复路径：
+// 平台没有 skill 间依赖机制，装本 skill 时不会自动装上 webclaw3，所以报错里必须点名 webclaw3
+// 并给出安装命令，否则用户只看到一个陌生端口号，无从下手。
+const WEBCLAW3_INSTALL_CMD = 'npx clawhub@latest install fatmind/webclaw3-browser-automation';
+const WEBCLAW3_SKILL_URL = 'https://clawhub.ai/fatmind/skills/webclaw3-browser-automation';
+const WEBCLAW3_REPO_URL = 'https://github.com/fatmind/webclaw3';
+
+// 两种失败原因完全不同，修复动作也不同，不能合并成一条报错：
+// ① relay 连不上   → webclaw3 没装，或 relay 没启动（第一层依赖：一条命令可解决）
+// ② relay 通但扩展未连 → webclaw3 装了但 Chrome 扩展没加载 / Access Key 没配（第二层：webclaw3 自身首次配置）
 async function ensureRelay() {
+  let status;
   try {
-    const status = await (await fetch(`${RELAY_URL}/api/status`)).json();
-    if (!status.extensionConnected) throw new Error('Extension not connected');
+    status = await (await fetch(`${RELAY_URL}/api/status`)).json();
   } catch (e) {
-    throw new Error(`Relay not available at ${RELAY_URL}. Is relay running? ${e.message}`);
+    throw new Error(
+      `本 skill 需要 webclaw3 提供的浏览器运行时，但 ${RELAY_URL} 连不上（${e.message}）。\n` +
+      `\n原因：webclaw3 没有安装，或它的 relay 没有启动。本 skill 无法独立运行——安装本 skill 时不会自动装上 webclaw3，需要单独装一次。\n` +
+      `\n修复：\n` +
+      `  1. 安装 webclaw3：${WEBCLAW3_INSTALL_CMD}\n` +
+      `  2. 装好后对 Agent 说「检查 webclaw3 环境」，它会启动 relay 并校验配置\n` +
+      `  3. 回来重跑本 skill\n` +
+      `\n主品页面：${WEBCLAW3_SKILL_URL}\n安装指南（3 步，约 5 分钟）：${WEBCLAW3_REPO_URL}`
+    );
+  }
+  if (!status.extensionConnected) {
+    throw new Error(
+      `webclaw3 的 relay 已在 ${RELAY_URL} 运行，但 Chrome 扩展没有连上，浏览器操作无法执行。\n` +
+      `\n原因：webclaw3 的 Chrome 扩展没有加载（需在 chrome://extensions 开启开发者模式后手动加载），或 Access Key 没有配置。这是 webclaw3 自身的首次配置，只需做一次。\n` +
+      `\n修复：对 Agent 说「检查 webclaw3 环境」，它会给出扩展加载与 Access Key 的具体步骤。\n` +
+      `\n安装指南：${WEBCLAW3_REPO_URL}`
+    );
   }
 }
 
@@ -125,7 +151,24 @@ function callClaudeWithFile(promptContent, promptFile, outputFile, opts = {}) {
     let stderr = '';
     child.stderr.on('data', d => { stderr += d; });
     child.on('close', code => {
-      if (code !== 0) return reject(new Error(`wc3-code exit ${code}: ${stderr.slice(0, 500)}`));
+      if (code !== 0) {
+        const detail = stderr.slice(0, 500);
+        // 子会话经 webclaw3 的本地 pipeline 服务（:3460）代跑。连不上时原始报错只说
+        // 「无法连接 serve」，同样不点名 webclaw3，这里补成自带修复路径的文案。
+        if (/无法连接\s*serve|ECONNREFUSED|fetch failed|3460/.test(detail)) {
+          return reject(new Error(
+            `本 skill 的分析环节需要 webclaw3 提供的本地 pipeline 服务（:3460），但连不上。\n` +
+            `\n原因：webclaw3 没有安装，或它的 pipeline 服务没有启动。\n` +
+            `\n修复：\n` +
+            `  1. 安装 webclaw3：${WEBCLAW3_INSTALL_CMD}\n` +
+            `  2. 对 Agent 说「检查 webclaw3 环境」，它会拉起 relay 与 pipeline\n` +
+            `  3. 回来重跑本 skill\n` +
+            `\n主品页面：${WEBCLAW3_SKILL_URL}\n` +
+            `\n原始报错：${detail}`
+          ));
+        }
+        return reject(new Error(`wc3-code exit ${code}: ${detail}`));
+      }
       try { resolve(JSON.parse(readFileSync(outputFile, 'utf-8'))); }
       catch { resolve(readFileSync(outputFile, 'utf-8')); }
     });
